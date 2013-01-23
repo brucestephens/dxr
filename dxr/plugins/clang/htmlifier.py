@@ -537,13 +537,16 @@ def load(tree, conn):
     _conn = conn
 
 #tokenizers = None
-_patterns = ('*.c', '*.cc', '*.cpp', '*.cxx', '*.h', '*.hpp')
+_patterns = ('*.c', '*.C', '*.cc', '*.cpp', '*.cxx', '*.h', '*.hpp')
 def htmlify(path, text):
     #if not tokenizers:
     #  # HACK around the fact that we can't load modules from plugin folders
     #  # we'll probably need to fix this later,
     #  #tpath = os.path.join(tree.config.plugin_folder, "cxx-clang", "tokenizers.py")
     #  #imp.load_source("tokenizers", tpath)
+
+    if path.find('doc/tutorial') != -1:
+        return None
 
     fname = os.path.basename(path)
     if any((fnmatch.fnmatchcase(fname, p) for p in _patterns)):
