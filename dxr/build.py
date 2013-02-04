@@ -181,6 +181,7 @@ def create_tables(tree, conn):
     conn.execute("CREATE VIRTUAL TABLE trg_index USING trilite")
     conn.executescript(dxr.languages.language_schema.get_create_sql())
 
+import codecs
 
 def _unignored_folders(folders, source_path, ignore_patterns, ignore_paths):
     """Yield the folders from ``folders`` which are not ignored by the given
@@ -229,6 +230,8 @@ def index_files(tree, conn):
             # the file
             with open(file_path, "r") as source_file:
                 data = source_file.read()
+                if data.startswith(codecs.BOM_UTF8):
+                    data = data[len(codecs.BOM_UTF8):]
 
             # Discard non-text files
             if not dxr.mime.is_text(file_path, data):
