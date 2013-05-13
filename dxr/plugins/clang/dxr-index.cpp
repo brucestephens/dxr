@@ -126,12 +126,12 @@ class PreprocThunk : public PPCallbacks {
   IndexConsumer *real;
 public:
   PreprocThunk(IndexConsumer *c) : real(c) {}
-  virtual void MacroDefined(const Token &MacroNameTok, const MacroInfo *MI);
-  virtual void MacroExpands(const Token &MacroNameTok, const MacroInfo *MI, SourceRange Range);
-  virtual void MacroUndefined(const Token &tok, const MacroInfo *MI);
-  virtual void Defined(const Token &tok);
-  virtual void Ifdef(SourceLocation loc, const Token &tok);
-  virtual void Ifndef(SourceLocation loc, const Token &tok);
+  virtual void MacroDefined(const Token &MacroNameTok, const MacroDirective *MI);
+  virtual void MacroExpands(const Token &MacroNameTok, const MacroDirective *MI, SourceRange Range, const MacroArgs*);
+  virtual void MacroUndefined(const Token &tok, const MacroDirective *MI);
+  virtual void Defined(const Token &tok, const MacroDirective *MI);
+  virtual void Ifdef(SourceLocation loc, const Token &tok, const MacroDirective *MI);
+  virtual void Ifndef(SourceLocation loc, const Token &tok, const  MacroDirective *MI);
 };
 
 class IndexConsumer : public ASTConsumer,
@@ -242,11 +242,14 @@ public:
   }
 
   void printScope(Decl *d) {
-    Decl *ctxt = Decl::castFromDeclContext(d->getNonClosureContext());
-    // Ignore namespace scopes, since it doesn't really help for source code
-    // organization
-    while (NamespaceDecl::classof(ctxt))
-      ctxt = Decl::castFromDeclContext(ctxt->getNonClosureContext());
+    DeclContext *ctx = d->getDeclContext();
+    if (!isa<NamedDecl>(ctx)) {
+      return;
+    }
+    Decl *ctxt = cast<NamedDecl>(ctx);
+
+    if (!ctxt || ctxt == d)
+      return;
     // If the scope is an anonymous struct/class/enum/union, replace it with the
     // typedef name here as well.
     if (NamedDecl::classof(ctxt)) {
@@ -684,13 +687,13 @@ public:
   }
 
   // Macros!
-  virtual void MacroDefined(const Token &MacroNameTok, const MacroInfo *MI) {
-    if (MI->isBuiltinMacro()) return;
-    if (!interestingLocation(MI->getDefinitionLoc())) return;
+  virtual void MacroDefined(const Token &MacroNameTok, const MacroDirective *MI) {
+    if (MI->getMacroInfo()->isBuiltinMacro()) return;
+    if (!interestingLocation(MI->getLocation())) return;
 
     // Yep, we're tokenizing this ourselves. Fun!
-    SourceLocation nameStart = MI->getDefinitionLoc();
-    SourceLocation textEnd = MI->getDefinitionEndLoc();
+    SourceLocation nameStart = MI->getDefinition().getMacroInfo()->getDefinitionLoc();
+    SourceLocation textEnd = MI->getDefinition().getMacroInfo()->getDefinitionEndLoc();
     unsigned int length =
       sm.getFileOffset(Lexer::getLocForEndOfToken(textEnd, 0, sm, features)) -
       sm.getFileOffset(nameStart);
@@ -752,40 +755,40 @@ public:
     *out << std::endl;
   }
 
-  virtual void MacroExpands(const Token &tok, const MacroInfo *MI, SourceRange Range) {
-    printMacroReference(tok, MI);
+  virtual void MacroExpands(const Token &tok, const MacroDirective *MI, SourceRange Range, const MacroArgs*) {
+    printMacroReference(tok, MI->getMacroInfo());
   }
-  virtual void MacroUndefined(const Token &tok, const MacroInfo *MI) {
-    printMacroReference(tok, MI);
+  virtual void MacroUndefined(const Token &tok, const MacroDirective *MI) {
+    printMacroReference(tok, MI->getMacroInfo());
   }
-  virtual void Defined(const Token &tok) {
-    printMacroReference(tok);
+  virtual void Defined(const Token &tok, const MacroDirective*MI) {
+    printMacroReference(tok, MI->getMacroInfo());
   }
-  virtual void Ifdef(SourceLocation loc, const Token &tok) {
-    printMacroReference(tok);
+  virtual void Ifdef(SourceLocation loc, const Token& tok, const MacroDirective *MI) {
+    printMacroReference(tok, MI->getMacroInfo());
   }
-  virtual void Ifndef(SourceLocation loc, const Token &tok) {
+  virtual void Ifndef(SourceLocation loc, const Token& tok, const MacroDirective *MI) {
     printMacroReference(tok);
   }
 };
 
-void PreprocThunk::MacroDefined(const Token &tok, const MacroInfo *MI) {
+void PreprocThunk::MacroDefined(const Token &tok, const MacroDirective *MI) {
   real->MacroDefined(tok, MI);
 }
-void PreprocThunk::MacroExpands(const Token &tok, const MacroInfo *MI, SourceRange Range) {
-  real->MacroExpands(tok, MI, Range);
+  void PreprocThunk::MacroExpands(const Token &tok, const MacroDirective *MI, SourceRange Range, const MacroArgs*MA) {
+    real->MacroExpands(tok, MI, Range, MA);
 }
-void PreprocThunk::MacroUndefined(const Token &tok, const MacroInfo *MI) {
+void PreprocThunk::MacroUndefined(const Token &tok, const MacroDirective *MI) {
   real->MacroUndefined(tok, MI);
 }
-void PreprocThunk::Defined(const Token &tok) {
-  real->Defined(tok);
+  void PreprocThunk::Defined(const Token &tok, const MacroDirective *MI) {
+    real->Defined(tok, MI);
 }
-void PreprocThunk::Ifdef(SourceLocation loc, const Token &tok) {
-  real->Ifdef(loc, tok);
+  void PreprocThunk::Ifdef(SourceLocation loc, const Token &tok, const MacroDirective*MI) {
+    real->Ifdef(loc, tok, MI);
 }
-void PreprocThunk::Ifndef(SourceLocation loc, const Token &tok) {
-  real->Ifndef(loc, tok);
+  void PreprocThunk::Ifndef(SourceLocation loc, const Token &tok, const MacroDirective *MI) {
+    real->Ifndef(loc, tok, MI);
 }
 
 class DXRIndexAction : public PluginASTAction {
