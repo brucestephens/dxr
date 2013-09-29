@@ -6,12 +6,12 @@ You'll need llvm and clang, at least 3.3.  Trunk should work fine.
 
 The following should build the clang plugin:
 
-   % make
+    % make
 
 Then do the normal build and install of the python bits
 
-   % python setup.py build
-   % python setup.py install
+    % python setup.py build
+    % python setup.py install
 
 (use `--user` on the `install` to install into `~/.local`.)
 
