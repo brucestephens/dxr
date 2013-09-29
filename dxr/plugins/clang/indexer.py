@@ -3,63 +3,100 @@ import json
 import dxr.plugins
 import dxr.schema
 import os, sys
+import glob
 import re, urllib
 from dxr.languages import language_schema
 
 
 PLUGIN_NAME   = 'clang'
 
-__all__ = dxr.plugins.indexer_exports()
 
-
+incremental = False
 def pre_process(tree, env):
+    global incremental
+    incremental = tree.incremental
     # Setup environment variables for inspecting clang as runtime
     # We'll store all the havested metadata in the plugins temporary folder.
-    temp_folder   = os.path.join(tree.temp_folder, 'plugins', PLUGIN_NAME)
-    plugin_folder = os.path.join(tree.config.plugin_folder, PLUGIN_NAME)
+    temp_folder   = os.path.join(tree.temp_folder, PLUGIN_NAME)
+    indexer_dir = os.path.dirname(sys.modules['dxr.plugins.clang.indexer'].__file__)
     flags = [
-        '-load', os.path.join(plugin_folder, 'libclang-index-plugin.so'),
+        '-load', os.path.join(indexer_dir, 'libclang-index-plugin.so'),
         '-add-plugin', 'dxr-index',
         '-plugin-arg-dxr-index', tree.source_folder
     ]
     flags_str = ""
     for flag in flags:
         flags_str += ' -Xclang ' + flag
-    env['CC']   = "clang %s"   % flags_str
-    env['CXX']  = "clang++ %s" % flags_str
-    env['DXR_CC'] = env['CC']
-    env['DXR_CXX'] = env['CXX']
-    env['DXR_CLANG_FLAGS'] = flags_str
+    flags_str += ' -Qunused-arguments '
     env['DXR_CXX_CLANG_OBJECT_FOLDER']  = tree.object_folder
-    env['DXR_CXX_CLANG_TEMP_FOLDER']    = temp_folder
+    env['DXR_CXX_CLANG_TEMP_FOLDER']    = os.path.join(tree.temp_folder,'clang')
+    for cc in 'cc','gcc','clang':
+        fn = os.path.join(tree.bin_folder,cc)
+        with open(fn, 'w') as f:
+            f.write('#!/bin/bash\n')
+            f.write('PATH=%s\n' % env['PATH'])
+            f.write('export DXR_CXX_CLANG_OBJECT_FOLDER=%s\n' % env['DXR_CXX_CLANG_OBJECT_FOLDER'])
+            f.write('export DXR_CXX_CLANG_TEMP_FOLDER=%s\n' % env['DXR_CXX_CLANG_TEMP_FOLDER'])
+            f.write('exec clang %s "$@"\n' % flags_str)
+        os.chmod(fn, 0700)
+    for cc in 'c++','g++','clang++':
+        fn = os.path.join(tree.bin_folder,cc)
+        with open(fn, 'w') as f:
+            f.write('#!/bin/bash\n')
+            f.write('PATH=%s\n' % env['PATH'])
+            f.write('export DXR_CXX_CLANG_OBJECT_FOLDER=%s\n' % env['DXR_CXX_CLANG_OBJECT_FOLDER'])
+            f.write('export DXR_CXX_CLANG_TEMP_FOLDER=%s\n' % env['DXR_CXX_CLANG_TEMP_FOLDER'])
+            f.write('exec clang++ %s "$@"\n' % flags_str)
+        os.chmod(fn, 0700)
+    env['PATH'] = tree.bin_folder+os.pathsep + env['PATH']
 
 
 def post_process(tree, conn):
-    print "cxx-clang post-processing:"
-    print " - Adding tables"
-    conn.executescript(schema.get_create_sql())
+    global incremental
+    incremental = tree.incremental
+    print "cxx-clang post-processing:"; sys.stdout.flush()
+    if not tree.incremental:
+        print " - Adding tables"; sys.stdout.flush()
+        conn.executescript(schema.get_create_sql())
 
-    print " - Processing files"
-    temp_folder = os.path.join(tree.temp_folder, 'plugins', PLUGIN_NAME)
-    for f in os.listdir(temp_folder):
-        csv_path = os.path.join(temp_folder, f)
-        dump_indexer_output(conn, csv_path)
+        for t in 'functions','variables','typedefs','macros','types','scopes':
+            conn.execute('CREATE INDEX %s on %s(name)' % (t+'_name_index', t))
 
+        conn.execute('DROP TABLE IF EXISTS max_id')
+        conn.execute('CREATE TABLE max_id (kind TEXT UNIQUE, id INTEGER)')
+    else:
+        read_files(conn)
+
+    print " - Processing files"; sys.stdout.flush()
+    temp_folder = os.path.join(tree.temp_folder, PLUGIN_NAME)
+    for f in glob.iglob(os.path.join(temp_folder, '*.csv.gz')):
+        dump_indexer_output(conn, f)
+        os.remove(f)
+
+    conn.commit()
+    conn.execute('CREATE TABLE impl_tmp (file_id INTEGER, file_line INTEGER, file_col INTEGER,' \
+                 'base_file_id INTEGER, base_file_line INTEGER, base_file_col INTEGER, access VARCHAR(32))')
+    conn.execute('INSERT INTO impl_tmp SELECT DISTINCT * FROM impl')
+    conn.execute('DROP TABLE impl')
+    conn.execute('ALTER TABLE impl_tmp RENAME TO impl')
+    conn.commit()
+    conn.execute('CREATE INDEX impl_file_index ON impl(file_id,file_line,file_col)')
+    conn.execute('CREATE INDEX impl_base_file_index ON impl(base_file_id,base_file_line,base_file_col)')
+    conn.commit()
+
+def db_fixup(conn):
     fixup_scope(conn)
-    
-    print " - Generating callgraph"
-    generate_callgraph(conn)
-    
-    print " - Generating inheritance graph"
+
+    print " - Generating inheritance graph"; sys.stdout.flush()
     generate_inheritance(conn)
 
-    print " - Updating definitions"
+    print " - Updating definitions"; sys.stdout.flush()
     update_defids(conn)
 
-    print " - Updating references"
+    print " - Updating references"; sys.stdout.flush()
     update_refs(conn)
 
-    print " - Committing changes"
+    print " - Committing changes"; sys.stdout.flush()
     conn.commit()
 
 
@@ -67,106 +104,86 @@ def post_process(tree, conn):
 schema = dxr.schema.Schema({
     # Typedef information in the tables
     "typedefs": [
-        ("id", "INTEGER", False),              # The typedef's id
+        ("_location", True, 'scope'),
         ("name", "VARCHAR(256)", False),       # Simple name of the typedef
         ("qualname", "VARCHAR(256)", False),   # Fully-qualified name of the typedef
+        ("modifiers", "VARCHAR(256)", True),  # Modifiers (e.g., private)
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_location", True),
-        ("_key", "id"),
+        ("_ulocation", True, 'decl'),
         ("_index", "qualname"),
     ],
     # Namespaces
     "namespaces": [
-        ("id", "INTEGER", False),              # The namespaces's id
         ("name", "VARCHAR(256)", False),       # Simple name of the namespace
         ("qualname", "VARCHAR(256)", False),   # Fully-qualified name of the namespace
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_location", True),
-        ("_key", "id"),
+        ("_location", True, 'decl'),
         ("_index", "qualname"),
     ],
     # References to namespaces
     "namespace_refs": [
-        ("refid", "INTEGER", True),      # ID of the namespace being referenced
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
+        ("qualname", "VARCHAR(256)", False),
         ("_location", True),
-        ("_location", True, 'referenced'),
-        ("_fkey", "refid", "namespaces", "id"),
-        ("_index", "refid"),
     ],
     # Namespace aliases
     "namespace_aliases": [
-        ("id", "INTEGER", False),              # The namespace alias's id
         ("name", "VARCHAR(256)", False),       # Simple name of the namespace alias
         ("qualname", "VARCHAR(256)", False),   # Fully-qualified name of the namespace alias
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
         ("_location", True),
-        ("_key", "id"),
+        ("_location", True, 'decl'),
         ("_index", "qualname"),
     ],
     # References to namespace aliases
     "namespace_alias_refs": [
-        ("refid", "INTEGER", True),      # ID of the namespace alias being referenced
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
+        ("qualname", "VARCHAR(256)", False),   # Fully-qualified name of the namespace alias
         ("_location", True),
-        ("_location", True, 'referenced'),
-        ("_fkey", "refid", "namespace_aliases", "id"),
-        ("_index", "refid"),
     ],
     # References to functions
     "function_refs": [
-        ("refid", "INTEGER", True),      # ID of the function being referenced
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_location", True),
-        ("_location", True, 'referenced'),
-        ("_fkey", "refid", "functions", "id"),
-        ("_index", "refid"),
+        ("_ulocation", True),
+        ("_location", True, 'decl'),
+        ("qualname", "VARCHAR(256)", True),
     ],
     # References to macros
     "macro_refs": [
-        ("refid", "INTEGER", True),      # ID of the macro being referenced
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_location", True),
-        ("_location", True, 'referenced'),
-        ("_fkey", "refid", "macros", "id"),
-        ("_index", "refid"),
+        ("_ulocation", True),
+        ("_location", True, 'decl'),
     ],
     # References to types
     "type_refs": [
-        ("refid", "INTEGER", True),      # ID of the type being referenced
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_location", True),
-        ("_location", True, 'referenced'),
-        ("_fkey", "refid", "types", "id"),
-        ("_index", "refid"),
+        ("_ulocation", True),
+        ("_location", True, 'decl'),
+        ("qualname", "VARCHAR(256)", True),
     ],
     # References to typedefs
     "typedef_refs": [
-        ("refid", "INTEGER", True),      # ID of the typedef being referenced
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_location", True),
-        ("_location", True, 'referenced'),
-        ("_fkey", "refid", "typedefs", "id"),
-        ("_index", "refid"),
+        ("_ulocation", True),
+        ("_location", True, 'decl'),
+        ("qualname", "VARCHAR(256)", True),
     ],
     # References to variables
     "variable_refs": [
-        ("refid", "INTEGER", True),      # ID of the variable being referenced
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_location", True),
-        ("_location", True, 'referenced'),
-        ("_fkey", "refid", "variables", "id"),
-        ("_index", "refid"),
+        ("_ulocation", True),
+        ("_location", True, 'decl'),
+        ("qualname", "VARCHAR(256)", True),
     ],
     # Warnings found while compiling
     "warnings": [
@@ -174,79 +191,62 @@ schema = dxr.schema.Schema({
         ("opt", "VARCHAR(64)", True),   # option controlling this warning (-Wxxx)
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_location", True),
+        ("_ulocation", True),
     ],
     # Declaration/definition mapping for functions
     "function_decldef": [
-        ("defid", "INTEGER", True),    # ID of the definition instance
-        ("_location", True),
-        ("_location", True, 'definition'),
+        ("_ulocation", True),
         # Extents of the declaration
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_fkey", "defid", "functions", "id"),
-        ("_index", "defid"),
     ],
     # Declaration/definition mapping for types
     "type_decldef": [
-        ("defid", "INTEGER", True),    # ID of the definition instance
-        ("_location", True),
-        ("_location", True, 'definition'),
+        ("_ulocation", True),
         # Extents of the declaration
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_fkey", "defid", "types", "id"),
-        ("_index", "defid"),
     ],
     # Declaration/definition mapping for variables
     "variable_decldef": [
-        ("defid", "INTEGER", True),    # ID of the definition instance
-        ("_location", True),
-        ("_location", True, 'definition'),
+        ("_ulocation", True),
         # Extents of the declaration
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_fkey", "defid", "variables", "id"),
-        ("_index", "defid"),
     ],
     # Macros: this is a table of all of the macros we come across in the code.
     "macros": [
-        ("id", "INTEGER", False),        # The macro id, for references
         ("name", "VARCHAR(256)", False), # The name of the macro
         ("args", "VARCHAR(256)", True),  # The args of the macro (if any)
         ("text", "TEXT", True),          # The macro contents
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("_location", True),
-        ("_key", "id"),
+        ("_ulocation", True, 'decl'),
     ],
-    # The following two tables are combined to form the callgraph implementation.
-    # In essence, the callgraph can be viewed as a kind of hypergraph, where the
-    # edges go from functions to sets of functions and variables. For use in the
-    # database, we are making some big assumptions: the targetid is going to be
-    # either a function or variable (the direct thing we called); if the function
-    # is virtual or the target is a variable, we use the targets table to identify
-    # what the possible implementations could be.
-    "callers": [
-        ("callerid", "INTEGER", False), # The function in which the call occurs
-        ("targetid", "INTEGER", False), # The target of the call
-        ("_key", "callerid", "targetid"),
-        ("_fkey", "callerid", "functions", "id")
+    # includes: this is a table of all of the includes we process
+    "includes": [
+        ("inc", "INTEGER", True), # The file that's been included
+        ("_ulocation", True),
+        ("extent_start", "INTEGER", True),
+        ("extent_end", "INTEGER", True),
     ],
-    "targets": [
-        ("targetid", "INTEGER", False), # The target of the call
-        ("funcid", "INTEGER", False),   # One of the functions in the target set
-        ("_key", "targetid", "funcid"),
-        ("_fkey", "targetid", "functions", "id")
-    ]
 })
 
 
 file_cache = {}
+file_cache_inv = {}
 decl_master = {}
 inheritance = {}
 calls = {}
 overrides = {}
+
+def read_files(conn):
+    global file_cache
+    global file_cache_inv
+
+    for row in conn.execute("SELECT id,path FROM files"):
+        file_cache[row[1]] = row[0]
+        file_cache_inv[int(row[0])] = row[1]
 
 def getFileID(conn, path):
     global file_cache
@@ -261,8 +261,48 @@ def getFileID(conn, path):
     file_id = None
     if row:
         file_id = row[0]
+    else:
+        if path[0] == '/':
+            return None
+        if path[0] == '<':
+            return None
+        if path.startswith('--GENERATED--'):
+            return None
+        cur.execute("INSERT INTO files (path) VALUES (?)", (path,))
+        row = cur.execute("SELECT id from files where path=?", (path,)).fetchone()
+        if row:
+            file_id = row[0]
+        else:
+            sys.exit(1)
     file_cache[path] = file_id
     return file_id
+
+processed={}
+def clean(file_id, conn):
+    global incremental
+    global processed
+    if not incremental:
+        return
+    if file_id in processed:
+        return
+
+    global file_cache_inv
+
+    processed[file_id] = True
+    cur = conn.cursor()
+    for kind in ['function','variable','type']:
+        cur.execute('DELETE FROM '+kind+'s WHERE file_id=?',(file_id,))
+        cur.execute('DELETE FROM '+kind+'_decldef WHERE file_id=?',(file_id,))
+    for kind in ['typedef','namespace','macro']:
+        cur.execute('DELETE FROM '+kind+'s WHERE decl_file_id=?',(file_id,))
+    for kind in ['include','warning','scope']:
+        cur.execute('DELETE FROM '+kind+'s WHERE file_id=?',(file_id,))
+
+    for kind in ['function','macro','namespace','type','typedef','variable']:
+        cur.execute('DELETE FROM '+kind+'_refs WHERE file_id=?',(file_id,))
+
+    for kind in ['alias_refs','aliases']:
+        cur.execute('DELETE FROM namespace_'+kind+' WHERE file_id=?',(file_id,))
 
 def splitLoc(conn, value):
     arr = value.split(':')
@@ -294,7 +334,7 @@ def fixupExtent(args, extents_key):
     del args[extents_key]
 
 def getScope(args, conn):
-    row = conn.execute("SELECT id FROM scopes WHERE file_id=? AND file_line=? AND file_col=?",
+    row = conn.execute("SELECT file_id FROM scopes WHERE file_id=? AND file_line=? AND file_col=?",
                                           (args['file_id'], args['file_line'], args['file_col'])).fetchone()
 
     if row is not None:
@@ -302,10 +342,9 @@ def getScope(args, conn):
 
     return None
 
-def addScope(args, conn, name, id):
+def addScope(args, conn, name):
     scope = {}
     scope['name'] = args[name]
-    scope['id'] = args[id]
     scope['file_id'] = args['file_id']
     scope['file_line'] = args['file_line']
     scope['file_col'] = args['file_col']
@@ -333,31 +372,24 @@ def handleScope(args, conn, canonicalize=False):
     scopeid = getScope(scope, conn)
 
     if scopeid is None:
-        scope['id'] = scopeid = dxr.utils.next_global_id()
         stmt = language_schema.get_insert_sql('scopes', scope)
         conn.execute(stmt[0], stmt[1])
 
     if scopeid is not None:
-        args['scopeid'] = scopeid
+        args['scope_file_id'], args['scope_file_line'], args['scope_file_col'] = scope['file_id'], scope['file_line'], scope['file_col']
 
 def process_decldef(args, conn):
     if 'kind' not in args:
         return None
 
-    # Store declaration map basics on memory
-    name, defloc, declloc = args['name'], args['defloc'], args['declloc']
-    defid, defline, defcol = splitLoc(conn, args['defloc'])
-    declid, declline, declcol = splitLoc (conn, args['declloc'])
-    if defid is None or declid is None:
+    declloc = args['declloc']
+    declid, declline, declcol = splitLoc (conn, declloc)
+    if declid is None:
         return None
 
-    # FIXME: should kind be included in this mapping?
-    decl_master[(name, declid, declline, declcol)] = (defid, defline, defcol)
-    decl_master[(name, defid, defline, defcol)] = (defid, defline, defcol)
+    clean(declid, conn)
 
     if not fixupEntryPath(args, 'declloc', conn):
-        return None
-    if not fixupEntryPath(args, 'defloc', conn, 'definition'):
         return None
     fixupExtent(args, 'extent')
     
@@ -366,15 +398,16 @@ def process_decldef(args, conn):
 def process_type(args, conn):
     if not fixupEntryPath(args, 'loc', conn):
         return None
+    if not fixupEntryPath(args, 'declloc', conn, 'decl'):
+        return None
+
+    clean(args['file_id'], conn)
 
     # Scope might have been previously added to satisfy other process_* call
     scopeid = getScope(args, conn)
 
-    if scopeid is not None:
-        args['id'] = scopeid
-    else:
-        args['id'] = dxr.utils.next_global_id()
-        addScope(args, conn, 'name', 'id')
+    if scopeid is None:
+        addScope(args, conn, 'name')
 
     handleScope(args, conn)
     fixupExtent(args, 'extent')
@@ -382,39 +415,54 @@ def process_type(args, conn):
     return language_schema.get_insert_sql('types', args)
 
 def process_typedef(args, conn):
-    args['id'] = dxr.utils.next_global_id()
-    if not fixupEntryPath(args, 'loc', conn):
+    if not fixupEntryPath(args, 'declloc', conn, 'decl'):
         return None
+
+    clean(args['decl_file_id'], conn)
+
     fixupExtent(args, 'extent')
-#  handleScope(args, conn)
+    handleScope(args, conn)
     return schema.get_insert_sql('typedefs', args)
 
 def process_function(args, conn):
     if not fixupEntryPath(args, 'loc', conn):
         return None
+    if not fixupEntryPath(args, 'declloc', conn, 'decl'):
+        return None
+
+    clean(args['file_id'], conn)
+
     scopeid = getScope(args, conn)
 
-    if scopeid is not None:
+    if scopeid is None:
         args['id'] = scopeid
-    else:
-        args['id'] = dxr.utils.next_global_id()
-        addScope(args, conn, 'name', 'id')
+        addScope(args, conn, 'name')
 
-    if 'overridename' in args:
-        overrides[args['id']] = (args['overridename'], args['overrideloc'])
+    if 'override' in args:
+        fixupEntryPath(args, 'override', conn, 'override')
 
     handleScope(args, conn)
     fixupExtent(args, 'extent')
     return language_schema.get_insert_sql('functions', args)
 
 def process_impl(args, conn):
-    inheritance[args['tbname'], args['tbloc'], args['tcname'], args['tcloc']] = args
-    return None
-
-def process_variable(args, conn):
-    args['id'] = dxr.utils.next_global_id()
     if not fixupEntryPath(args, 'loc', conn):
         return None
+    if not fixupEntryPath(args, 'base', conn, 'base'):
+        return None
+
+    clean(args['file_id'], conn)
+
+    return language_schema.get_insert_sql('impl', args)
+
+def process_variable(args, conn):
+    if not fixupEntryPath(args, 'loc', conn):
+        return None
+    if not fixupEntryPath(args, 'declloc', conn, 'decl'):
+        return None
+
+    clean(args['file_id'], conn)
+
     handleScope(args, conn)
     fixupExtent(args, 'extent')
     return language_schema.get_insert_sql('variables', args)
@@ -427,8 +475,11 @@ def process_ref(args, conn):
 
     if not fixupEntryPath(args, 'loc', conn):
         return None
-    if not fixupEntryPath(args, 'declloc', conn, 'referenced'):
-        return None
+    if 'declloc' in args:
+        fixupEntryPath(args, 'declloc', conn, 'decl')
+
+    clean(args['file_id'], conn)
+
     fixupExtent(args, 'extent')
 
     return schema.get_insert_sql(args['kind'] + '_refs', args)
@@ -436,15 +487,32 @@ def process_ref(args, conn):
 def process_warning(args, conn):
     if not fixupEntryPath(args, 'loc', conn):
         return None
+
+    clean(args['file_id'], conn)
+
     fixupExtent(args, 'extent')
     return schema.get_insert_sql('warnings', args)
 
-def process_macro(args, conn):
-    args['id'] = dxr.utils.next_global_id()
-    if 'text' in args:
-        args['text'] = args['text'].replace("\\\n", "\n").strip()
+def process_include(args, conn):
     if not fixupEntryPath(args, 'loc', conn):
         return None
+    args['inc'] = getFileID(conn, args['inc'])
+    if not args['inc']:
+        return None
+
+    clean(args['file_id'], conn)
+
+    fixupExtent(args, 'extent')
+    return schema.get_insert_sql('includes', args)
+
+def process_macro(args, conn):
+    if 'text' in args:
+        args['text'] = args['text'].replace("\\\n", "\n").strip()
+    if not fixupEntryPath(args, 'declloc', conn, 'decl'):
+        return None
+
+    clean(args['decl_file_id'], conn)
+
     fixupExtent(args, 'extent')
     return schema.get_insert_sql('macros', args)
 
@@ -458,16 +526,20 @@ def process_call(args, conn):
     return None
 
 def process_namespace(args, conn):
-    if not fixupEntryPath(args, 'loc', conn):
+    if not fixupEntryPath(args, 'declloc', conn,'decl'):
         return None
-    args['id'] = dxr.utils.next_global_id()
+
+    clean(args['decl_file_id'], conn)
+
     fixupExtent(args, 'extent')
     return schema.get_insert_sql('namespaces', args)
 
 def process_namespace_alias(args, conn):
     if not fixupEntryPath(args, 'loc', conn):
         return None
-    args['id'] = dxr.utils.next_global_id()
+
+    clean(args['file_id'], conn)
+
     fixupExtent(args, 'extent')
     return schema.get_insert_sql('namespace_aliases', args)
 
@@ -488,8 +560,10 @@ def load_indexer_output(fname):
     finally:
         f.close()
 
+import gzip
+
 def dump_indexer_output(conn, fname):
-    f = open(fname, 'r')
+    f = gzip.open(fname, 'r')
     limit = 0
 
     try:
@@ -537,10 +611,6 @@ def canonicalize_decl(name, id, line, col):
     else:
         return (name, value[0], value[1], value[2])
 
-def recanon_decl(name, loc):
-    decl_master[name, loc] = loc
-    return (name, loc)
-
 def fixup_scope(conn):
     conn.execute ("UPDATE types SET scopeid = (SELECT id FROM scopes WHERE " +
                                 "scopes.file_id = types.file_id AND scopes.file_line = types.file_line " +
@@ -579,8 +649,9 @@ def generate_inheritance(conn):
         except KeyError:
             continue
 
-        conn.execute("INSERT OR IGNORE INTO impl(tbase, tderived, inhtype) VALUES (?, ?, ?)",
-                                  (base, child, info.get('access', '')))
+        conn.execute("INSERT OR IGNORE INTO impl(tbase, tderived, inhtype, file_id, dile_line, file_col) VALUES (?, ?, ?, ?, ?, ?)",
+                                  (base, child, info.get('access', ''),
+                                   child_loc[0], child_loc[1], child_loc[2]))
 
         # Get all known relations
         subs = childMap.setdefault(child, [])
@@ -602,97 +673,6 @@ def generate_inheritance(conn):
         newsupers = parentMap.setdefault(child, [])
         newsupers.append(base)
         newsupers.extend(supers)
-
-
-def generate_callgraph(conn):
-    global calls
-    functions = {}
-    variables = {}
-    callgraph = []
-
-    for row in conn.execute("SELECT qualname, file_id, file_line, file_col, id FROM functions").fetchall():
-        functions[(row[0], row[1], row[2], row[3])] = row[4]
-
-    for row in conn.execute("SELECT name, file_id, file_line, file_col, id FROM variables").fetchall():
-        variables[(row[0], row[1], row[2], row[3])] = row[4]
-
-    # Generate callers table
-    for call in calls.values():
-        if 'callername' in call:
-            caller_loc = splitLoc(conn, call['callerloc'])
-            if caller_loc[0] is None:
-                continue
-            source = canonicalize_decl(call['callername'], caller_loc[0], caller_loc[1], caller_loc[2])
-            call['callerid'] = functions.get(source)
-
-            if call['callerid'] is None:
-                continue
-        else:
-            call['callerid'] = 0
-
-        target_loc = splitLoc(conn, call['calleeloc'])
-        if target_loc[0] is None:
-            continue
-        target = canonicalize_decl(call['calleename'], target_loc[0], target_loc[1], target_loc[2])
-        targetid = functions.get(target)
-
-        if targetid is None:
-            targetid = variables.get(target)
-
-        if targetid is not None:
-            call['targetid'] = targetid
-            callgraph.append(call)
-
-    del variables
-
-    # Generate targets table
-    overridemap = {}
-
-    for func, funcid in functions.iteritems():
-        override = overrides.get(funcid)
-
-        if override is None:
-            continue
-
-        override_loc = splitLoc(conn, override[1])
-        if override_loc[0] is None:
-            continue
-        base = canonicalize_decl(override[0], override_loc[0], override_loc[1], override_loc[2])
-        basekey = functions.get(base)
-
-        if basekey is None:
-            continue
-
-        overridemap.setdefault(basekey, set()).add(funcid)
-
-    rescan = [x for x in overridemap]
-    while len(rescan) > 0:
-        base = rescan.pop(0)
-        childs = overridemap[base]
-        prev = len(childs)
-        temp = childs.union(*(overridemap.get(sub, []) for sub in childs))
-        childs.update(temp)
-        if len(childs) != prev:
-            rescan.append(base)
-
-    for base, childs in overridemap.iteritems():
-        conn.execute("INSERT OR IGNORE INTO targets (targetid, funcid) VALUES (?, ?)",
-                                  (-base, base));
-
-        for child in childs:
-            conn.execute("INSERT OR IGNORE INTO targets (targetid, funcid) VALUES (?, ?)",
-                                      (-base, child));
-
-    for call in callgraph:
-        if call['calltype'] == 'virtual':
-            targetid = call['targetid']
-            call['targetid'] = -targetid
-            if targetid not in overridemap:
-                overridemap[targetid] = set()
-                conn.execute("INSERT OR IGNORE INTO targets (targetid, funcid) VALUES (?, ?)",
-                                          (-targetid, targetid));
-        conn.execute("INSERT OR IGNORE INTO callers (callerid, targetid) VALUES (?, ?)",
-                                    (call['callerid'], call['targetid']))
 
 
 def update_defids(conn):

@@ -1,17 +1,6 @@
 import ctypes
 
-# Load the trilite plugin.
-#
-# If you ``import sqlite3`` before doing this, it's likely that the system
-# version of sqlite will be loaded, and then trilite, if built against a
-# different version, will fail to load. If you're having trouble getting
-# trilite to load, make sure you're not importing sqlite3 beforehand. Afterward
-# is fine.
-ctypes.CDLL('libtrilite.so').load_trilite_extension()
-
 import os
-from os import dup
-import jinja2
 import sqlite3
 import string
 from sys import stdout
@@ -21,7 +10,7 @@ from urllib import quote, quote_plus
 def connect_database(tree):
     """Connect to database ensuring that dependencies are built first"""
     # Create connection
-    conn = sqlite3.connect(os.path.join(tree.target_folder, ".dxr-xref.sqlite"))
+    conn = sqlite3.connect(os.path.join(tree.source_folder,"dxr-xref.sqlite"))
     # Configure connection
     conn.execute("PRAGMA synchronous=off")  # TODO Test performance without this
     conn.execute("PRAGMA page_size=32768")
@@ -31,35 +20,25 @@ def connect_database(tree):
     conn.row_factory  = sqlite3.Row
     return conn
 
-
-_template_env = None
-def load_template_env(temp_folder, template_folder):
-    """Load template environment (lazily)"""
-    global _template_env
-    if not _template_env:
-        # Cache folder for jinja2
-        tmpl_cache = os.path.join(temp_folder, 'jinja2_cache')
-        if not os.path.isdir(tmpl_cache):
-            os.mkdir(tmpl_cache)
-        # Create jinja2 environment
-        _template_env = jinja2.Environment(
-                loader          = jinja2.FileSystemLoader(template_folder),
-                auto_reload     = False,
-                bytecode_cache  = jinja2.FileSystemBytecodeCache(tmpl_cache)
-        )
-    return _template_env
-
-
-_next_id = 1
-def next_global_id():
-    """Source of unique ids"""
+_next_id = None
+def next_global_id(conn,kind):
+    """ Source of unique ids """
     #TODO Please stop using this, it makes distribution and parallelization hard
     # Also it's just stupid!!! When whatever SQL database we use supports this
     global _next_id
+    if not _next_id:
+        row = conn.execute('SELECT id FROM max_id WHERE kind="all"').fetchone()
+        if row and row[0]:
+            _next_id = row[0]+1
+        else:
+            _next_id = 1
     n = _next_id
     _next_id += 1
     return n
 
+def update_max(conn):
+    global _next_id
+    conn.execute('INSERT OR REPLACE INTO max_id VALUES("all",?)',(_next_id,))
 
 def open_log(config_or_tree, name, use_stdout=False):
     """Return a writable file-like object representing a log file.

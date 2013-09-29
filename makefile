@@ -1,37 +1,19 @@
-PLUGINS = clang pygmentize
-
-BUILD_PLUGINS = $(PLUGINS:%=build-plugin-%)
-CHECK_PLUGINS = $(PLUGINS:%=check-plugin-%)
-CLEAN_PLUGINS = $(PLUGINS:%=clean-plugin-%)
-
 all: build
 
 test: build
 	LD_LIBRARY_PATH=$$LD_LIBRARY_PATH:`pwd`/trilite python2 setup.py test
 
-build: $(BUILD_PLUGINS) trilite
+build: build-clang-plugin
 
-check: $(CHECK_PLUGINS) trilite
+clean: clean-clang-plugin
 
-clean: $(CLEAN_PLUGINS) trilite-clean
+build-clang-plugin:
+	$(MAKE) -C dxr/plugins/clang build
 
-trilite:
-	$(MAKE) -C trilite/ release
-
-trilite-clean:
-	$(MAKE) -C trilite/ clean
-
-$(BUILD_PLUGINS):
-	$(MAKE) -C $(@:build-plugin-%=dxr/plugins/%) build
-
-$(CHECK_PLUGINS):
-	$(MAKE) -C $(@:check-plugin-%=dxr/plugins/%) check
-
-$(CLEAN_PLUGINS):
-	$(MAKE) -C $(@:clean-plugin-%=dxr/plugins/%) clean
+clean-clang-plugin:
+	$(MAKE) -C dxr/plugins/clang clean
 
 
-.PHONY: $(BUILD_PLUGINS)
-.PHONY: $(CHECK_PLUGINS)
-.PHONY: $(CLEAN_PLUGINS)
+.PHONY: build-clang-plugin
+.PHONY: clean-clang-plugin
 .PHONY: all build check clean test trilite trilite-clean

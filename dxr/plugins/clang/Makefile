@@ -1,3 +1,4 @@
+DEBUG = 1
 LLVM_CONFIG ?= llvm-config
 LLVM_LDFLAGS := $(shell ${LLVM_CONFIG} --ldflags)
 CXXFLAGS := $(shell ${LLVM_CONFIG} --cxxflags) -Wall -Wno-strict-aliasing \
@@ -19,4 +20,7 @@ check: build
 clean:
 	$(RM) *.o libclang-index-plugin.so
 
-.PHONY: build clean
+.PHONY: build clean check-syntax
+
+check-syntax:
+	$(CXX) $(CXXFLAGS) -o /dev/null -S ${CHK_SOURCES}

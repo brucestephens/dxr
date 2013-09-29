@@ -54,7 +54,7 @@ class SchemaTable(object):
         self.fkeys = []
         self.columns = []
         self.needLang = False
-        self.needFileKey = False
+        self.needFileKey = []
         defaults = ['VARCHAR(256)', True]
         for col in tblschema:
             if isinstance(tblschema, tuple) or isinstance(tblschema, list):
@@ -69,16 +69,16 @@ class SchemaTable(object):
                 self.fkeys.append(spec)
             elif col == '_index':
                 self.index = spec
-            elif col == '_location':
+            elif col == '_location' or col == '_ulocation':
                 if len(spec) <= 1:
                     prefix = ''
                 else:
                     prefix = spec[1] + "_"
-
+                unique = col == '_ulocation'
                 self.columns.append((prefix + "file_id", ["INTEGER", True]))
                 self.columns.append((prefix + "file_line", ["INTEGER", True]))
                 self.columns.append((prefix + "file_col", ["INTEGER", True]))
-                self.needFileKey = spec[0]
+                self.needFileKey.append((prefix,unique))
             elif col[0] != '_':
                 # if spec is deficient, we need to full it in with default tuples
                 values = list(spec)
@@ -114,8 +114,12 @@ class SchemaTable(object):
         sql += '\n);\n'
         if self.index is not None:
             sql += 'CREATE INDEX %s_%s_index on %s (%s);\n' % (self.name, '_'.join(self.index), self.name, ','.join(self.index))
-        if self.needFileKey is True:
-            sql += 'CREATE UNIQUE INDEX %s_file_index on %s (file_id, file_line, file_col);' % (self.name, self.name)
+        for (prefix,unique) in self.needFileKey:
+            uniq = ''
+            if unique:
+                uniq = 'UNIQUE'
+            sql += 'CREATE %s INDEX %s_%sfile_index on %s (%sfile_id, %sfile_line, %sfile_col);' % (uniq, self.name, prefix, self.name,
+                                                                                                        prefix, prefix, prefix)
         return sql
 
     def get_insert_sql(self, args):

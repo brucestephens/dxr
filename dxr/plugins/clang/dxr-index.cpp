@@ -9,13 +9,17 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
+#include <zlib.h>
 
 // Needed for sha1 hacks
 #include <fcntl.h>
@@ -40,13 +44,22 @@ std::string &operator+=(std::string &str, unsigned int i) {
   return str += (ptr + 1);
 }
 
-// BEWARE: use only as a temporary
-const char *hash(std::string &str) {
+std::string hash(const std::string &str) {
   static unsigned char rawhash[20];
   static char hashstr[41];
   sha1::calc(str.c_str(), str.size(), rawhash);
   sha1::toHexString(rawhash, hashstr);
-  return hashstr;
+  return std::string(hashstr,40);
+}
+
+std::string make_absolute(const std::string &str) {
+  if (!llvm::sys::path::is_relative(str))
+    return str;
+  SmallString<128> current_dir;
+  llvm::sys::fs::current_path(current_dir);
+  SmallVector<char, 256> path(current_dir.begin(), current_dir.end());
+  llvm::sys::path::append(path, str);
+  return std::string(path.begin(), path.end());
 }
 
 // This is a wrapper around NamedDecl::getQualifiedNameAsString.
@@ -104,13 +117,19 @@ std::string getQualifiedName(const NamedDecl &d) {
 std::string srcdir;
 std::string output;
 std::string tmpdir; // Place to save all the csv files to
+std::string cmd;
 
 struct FileInfo {
-  FileInfo(std::string &rname) : realname(rname) {
-    interesting = rname.compare(0, srcdir.length(), srcdir) == 0;
+  FileInfo(std::string &rname, bool ismain) : realname(rname), is_main(ismain) {
+    interesting = !realname.empty() && rname.compare(0, srcdir.length(), srcdir) == 0;
     if (interesting) {
-      // Remove the trailing `/' as well.
-      realname.erase(0, srcdir.length() + 1);
+      if (rname.find("conftest", 0) == 0 ||
+	  rname.find("/conftest") != rname.npos) {
+	interesting = false;
+      } else {
+	// Remove the trailing `/' as well.
+	realname.erase(0, srcdir.length() + 1);
+      }
     } else if (rname.compare(0, output.length(), output) == 0) {
       // We're in the output directory, so we are probably a generated header
       // We use the escape character to indicate the objdir nature.
@@ -122,6 +141,7 @@ struct FileInfo {
   std::string realname;
   std::ostringstream info;
   bool interesting;
+  bool is_main;
 };
 
 class IndexConsumer;
@@ -131,10 +151,14 @@ class PreprocThunk : public PPCallbacks {
 public:
   PreprocThunk(IndexConsumer *c) : real(c) {}
 #if CLANG_AT_LEAST(3, 3)
+  virtual void InclusionDirective(SourceLocation HashLoc, const Token& IncludeTok,
+				  StringRef FileName, bool IsAngled,
+				  CharSourceRange FileNameRange, const FileEntry* File,
+				  StringRef SearchPath, StringRef RelativePath, const Module*);
   virtual void MacroDefined(const Token &tok, const MacroDirective *md);
   virtual void MacroExpands(const Token &tok, const MacroDirective *md, SourceRange range, const MacroArgs *ma);
   virtual void MacroUndefined(const Token &tok, const MacroDirective *md);
-  virtual void Defined(const Token &tok, const MacroDirective *md);
+  virtual void Defined(const Token &tok, const MacroDirective *md, SourceRange);
   virtual void Ifdef(SourceLocation loc, const Token &tok, const MacroDirective *md);
   virtual void Ifndef(SourceLocation loc, const Token &tok, const MacroDirective *md);
 #else
@@ -158,7 +182,7 @@ private:
   LangOptions &features;
   DiagnosticConsumer *inner;
 
-  FileInfo *getFileInfo(std::string &filename) {
+  FileInfo *getFileInfo(std::string &filename, bool ismain) {
     std::map<std::string, FileInfo *>::iterator it;
     it = relmap.find(filename);
     if (it == relmap.end()) {
@@ -169,16 +193,16 @@ private:
       it = relmap.find(realstr);
       if (it == relmap.end()) {
         // Still didn't find it. Make the FileInfo structure
-        FileInfo *info = new FileInfo(realstr);
+        FileInfo *info = new FileInfo(realstr, ismain);
         it = relmap.insert(make_pair(realstr, info)).first;
       }
       it = relmap.insert(make_pair(filename, it->second)).first;
     }
     return it->second;
   }
-  FileInfo *getFileInfo(const char *filename) {
-    std::string filenamestr(filename);
-    return getFileInfo(filenamestr);
+  FileInfo *getFileInfo(const char *filename, bool ismain) {
+    std::string filenamestr(filename ? filename : "");
+    return getFileInfo(filenamestr, ismain);
   }
 public:
   IndexConsumer(CompilerInstance &ci) :
@@ -193,7 +217,15 @@ public:
     return new IndexConsumer(ci);
 
   }
-  
+
+  bool shouldVisitImplicitCode() const {
+    return true;
+  }
+
+  bool shouldVisitTemplateInstatiations() const {
+    return true;
+  }
+
   // Helpers for processing declarations
   // Should we ignore this location?
   bool interestingLocation(SourceLocation loc) {
@@ -209,22 +241,24 @@ public:
       return false;
 
     // Get the real filename
-    FileInfo *f = getFileInfo(filename);
+    FileInfo *f = getFileInfo(filename, ci.getSourceManager().isInMainFile(loc));
     return f->interesting;
   }
 
   std::string locationToString(SourceLocation loc) {
     PresumedLoc fixed = sm.getPresumedLoc(loc);
-    std::string buffer = getFileInfo(fixed.getFilename())->realname;
-    buffer += ":";
-    buffer += fixed.getLine();
-    buffer += ":";
-    buffer += fixed.getColumn();
+    std::string buffer = getFileInfo(fixed.getFilename(), ci.getSourceManager().isInMainFile(loc))->realname;
+    if (!buffer.empty()) {
+      buffer += ":";
+      buffer += fixed.getLine();
+      buffer += ":";
+      buffer += fixed.getColumn();
+    }
     return buffer;
   }
 
   void beginRecord(const char *name, SourceLocation loc) {
-    FileInfo *f = getFileInfo(sm.getPresumedLoc(loc).getFilename());
+    FileInfo *f = getFileInfo(sm.getPresumedLoc(loc).getFilename(), ci.getSourceManager().isInMainFile(loc));
     out = &f->info;
     *out << name;
   }
@@ -271,7 +305,7 @@ public:
     // If the scope is an anonymous struct/class/enum/union, replace it with the
     // typedef name here as well.
     if (NamedDecl::classof(ctxt)) {
-      NamedDecl *scope = static_cast<NamedDecl*>(ctxt);
+      NamedDecl *scope = static_cast<NamedDecl*>(ctxt->getCanonicalDecl());
       NamedDecl *namesource = scope;
       if (TagDecl::classof(scope)) {
         TagDecl *tag = static_cast<TagDecl*>(scope);
@@ -284,14 +318,9 @@ public:
     }
   }
 
-  void declDef(const char *kind, const NamedDecl *decl, const NamedDecl *def, SourceLocation begin, SourceLocation end) {
-    if (!def || def == decl)
-      return;
-
+  void declDef(const char *kind, const NamedDecl *decl, SourceLocation begin, SourceLocation end) {
     beginRecord("decldef", decl->getLocation());
-    recordValue("name", getQualifiedName(*decl));
     recordValue("declloc", locationToString(decl->getLocation()));
-    recordValue("defloc", locationToString(def->getLocation()));
     if (kind)
       recordValue("kind", kind);
     printExtent(begin, end);
@@ -302,11 +331,21 @@ public:
   virtual void HandleTranslationUnit(ASTContext &ctx) {
     TraverseDecl(ctx.getTranslationUnitDecl());
 
+    std::string command;
+    if (!cmd.empty()) {
+      command = "\"compile\",\"";
+      command += cmd += "\"\n";
+    }
+
     // Emit all files now
     std::map<std::string, FileInfo *>::iterator it;
+    std::set<FileInfo*> processed;
     for (it = relmap.begin(); it != relmap.end(); it++) {
       if (!it->second->interesting)
         continue;
+      if (processed.find(it->second) != processed.end())
+	continue;
+      processed.insert(it->second);
       // Look at how much code we have
       std::string content = it->second->info.str();
       if (content.length() == 0)
@@ -317,15 +356,20 @@ public:
       filename += hash(it->second->realname);
       filename += ".";
       filename += hash(content);
-      filename += ".csv";
+      filename += ".csv.gz";
 
       // Okay, I want to use the standard library for I/O as much as possible,
       // but the C/C++ standard library does not have the feature of "open
       // succeeds only if it doesn't exist."
-      int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
-      if (fd != -1) {
-        write(fd, content.c_str(), content.length());
-        close(fd);
+      gzFile fd = gzopen(filename.c_str(), "wx");
+      (void)gzbuffer(fd, 16*1024);
+      (void)gzsetparams(fd, Z_BEST_SPEED, Z_DEFAULT_STRATEGY);
+      if (fd != NULL) {
+        gzwrite(fd, content.c_str(), content.length());
+	if (!command.empty() && it->second->is_main) {
+	  gzwrite(fd, command.c_str(), command.length());
+	}
+        gzclose(fd);
       }
     }
   }
@@ -348,12 +392,26 @@ public:
       recordValue("loc", locationToString(d->getLocation()));
       recordValue("kind", d->getKindName());
       printScope(d);
+      switch (d->getAccess()) {
+      case AS_protected:
+	recordValue("modifiers","protected");
+	break;
+      case AS_private:
+	recordValue("modifiers","private");
+	break;
+      default:
+	break;
+      }
+      const NamedDecl *decl = d->getCanonicalDecl();
+      recordValue("declloc", locationToString(decl->getLocation()));
+
       // Linkify the name, not the `enum'
       printExtent(nd->getLocation(), nd->getLocation());
       *out << std::endl;
+
+      declDef("type", decl, decl->getLocation(), decl->getLocation());
     }
 
-    declDef("type", d, d->getDefinition(), d->getLocation(), d->getLocation());
     return true;
   }
 
@@ -370,20 +428,20 @@ public:
       if (!base)
         return true;
       beginRecord("impl", d->getLocation());
-      recordValue("tcname", getQualifiedName(*d));
-      recordValue("tcloc", locationToString(d->getLocation()));
-      recordValue("tbname", getQualifiedName(*base));
-      recordValue("tbloc", locationToString(base->getLocation()));
-      *out << ",access,\"";
+      recordValue("loc", locationToString(d->getLocation()));
+      recordValue("base", locationToString(base->getLocation()));
+      std::string access;
       switch ((*iter).getAccessSpecifierAsWritten()) {
-      case AS_public: *out << "public"; break;
-      case AS_protected: *out << "protected"; break;
-      case AS_private: *out << "private"; break;
+      case AS_public: access = "public"; break;
+      case AS_protected: access ="protected"; break;
+      case AS_private: access = "private"; break;
       case AS_none: break; // It's implied, but we can ignore that
       }
       if ((*iter).isVirtual())
-        *out << " virtual";
-      *out << "\"" << std::endl;
+        access += " virtual";
+      if (!access.empty())
+	recordValue("access", access);
+      *out << std::endl;
     }
     return true;
   }
@@ -399,6 +457,32 @@ public:
       recordValue("name", d->getNameAsString());
       recordValue("qualname", getQualifiedName(*d));
       recordValue("type", d->getResultType().getAsString());
+      std::string modifiers;
+      switch (d->getAccess()) {
+      case AS_protected:
+	modifiers = "protected";
+	break;
+      case AS_private:
+	modifiers = "private";
+	break;
+      default:
+	break;
+      }
+      std::string kind;
+      if (CXXConstructorDecl* decl = dyn_cast<CXXConstructorDecl>(d)) {
+	if (decl->isExplicit()) {
+	  if (!modifiers.empty())
+	    modifiers += " ";
+	  modifiers += "explicit";
+	}
+	kind = "constructor";
+      } else if (dyn_cast<CXXDestructorDecl>(d)) {
+	kind = "destructor";
+      } else if (dyn_cast<CXXConversionDecl>(d)) {
+	kind = "conversion";
+      }
+      if (!modifiers.empty())
+	recordValue("modifiers", modifiers);
       std::string args("(");
       for (FunctionDecl::param_iterator it = d->param_begin();
           it != d->param_end(); it++) {
@@ -417,16 +501,30 @@ public:
         CXXMethodDecl *cxxd = dyn_cast<CXXMethodDecl>(d);
         CXXMethodDecl::method_iterator iter = cxxd->begin_overridden_methods();
         if (iter) {
-          recordValue("overridename", getQualifiedName(**iter));
-          recordValue("overrideloc", locationToString((*iter)->getLocation()));
+          recordValue("override", locationToString((*iter)->getLocation()));
         }
+	if (kind.empty())
+	  kind = "method";
       }
-      *out << std::endl;
-    }
+      if (!kind.empty())
+	recordValue("kind", kind);
 
-    const FunctionDecl *def;
-    if (d->isDefined(def))
-      declDef("function", d, def, d->getNameInfo().getBeginLoc(), d->getNameInfo().getEndLoc());
+      FunctionDecl *decl = d->getCanonicalDecl();
+      switch (d->getTemplatedKind()) {
+      case FunctionDecl::TK_MemberSpecialization:
+	decl = d->getInstantiatedFromMemberFunction();
+	break;
+      case FunctionDecl::TK_FunctionTemplateSpecialization:
+	decl = d->getTemplateSpecializationInfo()->getTemplate()->getTemplatedDecl();
+	break;
+      default:
+	break;
+      }
+      recordValue("declloc", locationToString(decl->getLocation()));
+      *out << std::endl;
+
+      declDef("function", decl, decl->getNameInfo().getBeginLoc(), decl->getNameInfo().getEndLoc());
+    }
 
     return true;
   }
@@ -451,14 +549,28 @@ public:
     const VarDecl *vd = dyn_cast<VarDecl>(d);
     if (!vd)
       return true;  // Things that are not VarDecls (FieldDecl, EnumConstantDecl) are always treated as definitions
-    if (!vd->isThisDeclarationADefinition())
-      return false;
-    if (!isa<ParmVarDecl>(d))
+    if (vd->isThisDeclarationADefinition())
       return true;
-    // This var is part of a parameter list.  Only treat it as
-    // a definition if a function is also being defined.
-    const FunctionDecl *fd = dyn_cast<FunctionDecl>(d->getDeclContext());
-    return fd && fd->isThisDeclarationADefinition();
+    if (isa<ParmVarDecl>(d)) {
+      // This var is part of a parameter list.  Only treat it as
+      // a definition if a function is also being defined.
+      const FunctionDecl *fd = dyn_cast<FunctionDecl>(d->getDeclContext());
+      return fd && fd->isThisDeclarationADefinition();
+    }
+    const VarDecl *def = vd->getDefinition();
+    if (!def) {
+      const VarDecl *first = vd->getFirstDeclaration();
+      const VarDecl *lastTentative = 0;
+      for (VarDecl::redecl_iterator i = first->redecls_begin(), e = first->redecls_end();
+	   *i && i != e; ++i) {
+	VarDecl::DefinitionKind kind = i->isThisDeclarationADefinition();
+	if (kind == VarDecl::TentativeDefinition) {
+	  lastTentative = *i;
+	}
+      }
+      def = lastTentative;
+    }
+    return vd == def;
   }
 
   void visitVariableDecl(ValueDecl *d) {
@@ -472,24 +584,22 @@ public:
       recordValue("loc", locationToString(d->getLocation()));
       recordValue("type", d->getType().getAsString(), true);
       printScope(d);
-      printExtent(d->getLocation(), d->getLocation());
-      *out << std::endl;
-    }
-    if (VarDecl *vd = dyn_cast<VarDecl>(d)) {
-      VarDecl *def = vd->getDefinition();
-      if (!def) {
-        VarDecl *first = vd->getFirstDeclaration();
-        VarDecl *lastTentative = 0;
-        for (VarDecl::redecl_iterator i = first->redecls_begin(), e = first->redecls_end();
-             i != e; ++i) {
-          VarDecl::DefinitionKind kind = i->isThisDeclarationADefinition();
-          if (kind == VarDecl::TentativeDefinition) {
-            lastTentative = *i;
-          }
-        }
-        def = lastTentative;
+      switch (d->getAccess()) {
+      case AS_protected:
+	recordValue("modifiers","protected");
+	break;
+      case AS_private:
+	recordValue("modifiers","private");
+	break;
+      default:
+	break;
       }
-      declDef("variable", vd, def, vd->getLocation(), vd->getLocation());
+      printExtent(d->getLocation(), d->getLocation());
+      const NamedDecl *decl = dyn_cast<NamedDecl>(d->getCanonicalDecl());
+      recordValue("declloc", locationToString(decl->getLocation()));
+      *out << std::endl;
+
+      declDef("variable", decl, decl->getLocation(), decl->getLocation());
     }
   }
 
@@ -518,9 +628,19 @@ public:
     beginRecord("typedef", d->getLocation());
     recordValue("name", d->getNameAsString());
     recordValue("qualname", getQualifiedName(*d));
-    recordValue("loc", locationToString(d->getLocation()));
+    recordValue("declloc", locationToString(d->getLocation()));
 //    recordValue("underlying", d->getUnderlyingType().getAsString());
     printScope(d);
+    switch (d->getAccess()) {
+    case AS_protected:
+      recordValue("modifiers","protected");
+      break;
+    case AS_private:
+      recordValue("modifiers","private");
+      break;
+    default:
+      break;
+    }
     printExtent(d->getLocation(), d->getLocation());
     *out << std::endl;
     return true;
@@ -535,7 +655,7 @@ public:
     beginRecord("typedef", d->getLocation());
     recordValue("name", d->getNameAsString());
     recordValue("qualname", getQualifiedName(*d));
-    recordValue("loc", locationToString(d->getLocation()));
+    recordValue("declloc", locationToString(d->getLocation()));
     printScope(d);
     printExtent(d->getLocation(), d->getLocation());
     *out << std::endl;
@@ -550,7 +670,7 @@ public:
     beginRecord("namespace", d->getLocation());
     recordValue("name", d->getNameAsString());
     recordValue("qualname", getQualifiedName(*d));
-    recordValue("loc", locationToString(d->getLocation()));
+    recordValue("declloc", locationToString(d->getLocation()));
     printExtent(d->getLocation(), d->getLocation());
     *out << std::endl;
     return true;
@@ -615,7 +735,7 @@ public:
 
   // Expressions!
   void printReference(const char *kind, NamedDecl *d, SourceLocation refLoc, SourceLocation end) {
-    if (!interestingLocation(d->getLocation()) || !interestingLocation(refLoc))
+    if (!interestingLocation(d->getLocation()) || !interestingLocation(refLoc) || d->isImplicit())
       return;
     std::string filename = sm.getBufferName(refLoc, NULL);
     if (filename.empty())
@@ -624,8 +744,15 @@ public:
       // now.
       return;
     beginRecord("ref", refLoc);
-    recordValue("qualname", getQualifiedName(*d));
-    recordValue("declloc", locationToString(d->getLocation()));
+    std::string qn(getQualifiedName(*d));
+    if (qn.find("::") != std::string::npos)
+      recordValue("qualname", qn);
+    NamedDecl* decl = dyn_cast<NamedDecl>(d->getCanonicalDecl());
+    if (TagDecl* tagdecl = dyn_cast<TagDecl>(d))
+      decl = tagdecl->getCanonicalDecl();
+    std::string declloc = locationToString(decl->getLocation());
+    if (!declloc.empty())
+      recordValue("declloc", declloc);
     recordValue("loc", locationToString(refLoc));
     if (kind)
       recordValue("kind", kind);
@@ -663,7 +790,7 @@ public:
 
     Decl *callee = e->getCalleeDecl();
     if (!callee || !interestingLocation(callee->getLocation()) ||
-        !NamedDecl::classof(callee))
+        !NamedDecl::classof(callee) || callee->isImplicit())
       return true;
 
     // Fun facts about call exprs:
@@ -693,6 +820,9 @@ public:
     }
     recordValue("calltype", type);
     *out << std::endl;
+
+    // printReference("function", dyn_cast<NamedDecl>(callee),
+    // 		   e->getLocStart(), e->getLocEnd());
     return true;
   }
 
@@ -721,6 +851,8 @@ public:
     recordValue("calltype", "static");
 
     *out << std::endl;
+
+    printReference("function", dyn_cast<NamedDecl>(callee), e->getLocStart(), e->getLocEnd());
     return true;
   }
 
@@ -862,6 +994,20 @@ public:
     *out << std::endl;
   }
 
+  virtual void InclusionDirective(SourceLocation HashLoc, const Token& IncludeTok,
+				  StringRef FileName, bool IsAngled,
+				  CharSourceRange FileNameRange, const FileEntry* File,
+				  StringRef SearchPath, StringRef RelativePath, const Module*) {
+    if (!interestingLocation(HashLoc)) return;
+    FileInfo* includedFile = getFileInfo(File->getName(), ci.getSourceManager().isInMainFile(HashLoc));
+    if (!includedFile->interesting) return;
+    beginRecord("include", HashLoc);
+    recordValue("inc", includedFile->realname);
+    recordValue("loc", locationToString(HashLoc));
+    printExtent(FileNameRange.getBegin(), FileNameRange.getEnd());
+    *out << std::endl;
+  }
+
   // Macros!
   virtual void MacroDefined(const Token &MacroNameTok, const MacroInfo *MI) {
     if (MI->isBuiltinMacro()) return;
@@ -898,7 +1044,7 @@ public:
       break;
     }
     beginRecord("macro", nameStart);
-    recordValue("loc", locationToString(nameStart));
+    recordValue("declloc", locationToString(nameStart));
     recordValue("name", std::string(contents, nameLen));
     if (argsStart > 0)
       recordValue("args", std::string(contents + argsStart,
@@ -921,6 +1067,8 @@ public:
     if (MI->isBuiltinMacro()) return;
 
     SourceLocation macroLoc = MI->getDefinitionLoc();
+    if (!interestingLocation(macroLoc)) return;
+
     SourceLocation refLoc = tok.getLocation();
     beginRecord("ref", refLoc);
     recordValue("name", std::string(ii->getNameStart(), ii->getLength()));
@@ -937,7 +1085,7 @@ public:
   virtual void MacroUndefined(const Token &tok, const MacroInfo *MI) {
     printMacroReference(tok, MI);
   }
-  virtual void Defined(const Token &tok, const MacroInfo *MI) {
+  virtual void Defined(const Token &tok, const MacroInfo *MI, SourceRange sr) {
     printMacroReference(tok, MI);
   }
   virtual void Ifdef(SourceLocation loc, const Token &tok, const MacroInfo *MI) {
@@ -949,6 +1097,12 @@ public:
 };
 
 #if CLANG_AT_LEAST(3, 3)
+void PreprocThunk::InclusionDirective(SourceLocation HashLoc, const Token& IncludeTok,
+				      StringRef FileName, bool IsAngled,
+				      CharSourceRange FileNameRange, const FileEntry* File,
+				      StringRef SearchPath, StringRef RelativePath, const Module*mod) {
+  real->InclusionDirective(HashLoc, IncludeTok, FileName, IsAngled, FileNameRange,File,SearchPath, RelativePath, mod);
+}
 void PreprocThunk::MacroDefined(const Token &tok, const MacroDirective *md) {
   real->MacroDefined(tok, md->getMacroInfo());
 }
@@ -958,8 +1112,8 @@ void PreprocThunk::MacroExpands(const Token &tok, const MacroDirective *md, Sour
 void PreprocThunk::MacroUndefined(const Token &tok, const MacroDirective *md) {
   real->MacroUndefined(tok, md->getMacroInfo());
 }
-void PreprocThunk::Defined(const Token &tok, const MacroDirective *md) {
-  real->Defined(tok, md->getMacroInfo());
+  void PreprocThunk::Defined(const Token &tok, const MacroDirective *md, SourceRange sr) {
+    real->Defined(tok, md->getMacroInfo(), sr);
 }
 void PreprocThunk::Ifdef(SourceLocation loc, const Token &tok, const MacroDirective *md) {
   real->Ifdef(loc, tok, md->getMacroInfo());
@@ -996,12 +1150,15 @@ protected:
 
   bool ParseArgs(const CompilerInstance &CI,
                  const std::vector<std::string>& args) {
-    if (args.size() != 1) {
+    if (args.size() < 1) {
       DiagnosticsEngine &D = CI.getDiagnostics();
       unsigned DiagID = D.getCustomDiagID(DiagnosticsEngine::Error,
         "Need an argument for the source directory");
       D.Report(DiagID);
       return false;
+    }
+    if (args.size() == 2) {
+      cmd = args[1];
     }
     // Load our directories
     char *abs_src = realpath(args[0].c_str(), NULL);
