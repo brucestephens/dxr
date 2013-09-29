@@ -1,136 +1,77 @@
-# DXR, A Code Search and Cross-Reference Tool
+-*- markdown -*-
 
+# Building #
 
-## Introduction
-DXR is a source code browser and search engine, building on the work of LXR and
-MXR. It supports full-text and regex searches as well as structural queries
-like "Find all the callers of this function." Behind the scenes, it uses
-trigram indices, the re2 library, and static analysis data collected by
-instrumented compilers. DXR runs only on Linux for the moment.
+You'll need llvm and clang, at least 3.3.  Trunk should work fine.
 
+The following should build the clang plugin:
 
-## Documentation
-DXR is fairly well documented, so whether you're looking to **deploy** DXR,
-**write plugins** or **templates** for DXR have a look at the `docs/` folder.
-The documents in this folder is a great starting point for anybody who wants
-to deploy and/or develop DXR.
+   % make
 
+Then do the normal build and install of the python bits
 
-## Quick Start
-To try out DXR on a HelloWorld-size project...
+   % python setup.py build
+   % python setup.py install
 
-    git clone --recursive git://github.com/mozilla/dxr.git
-    cd dxr  # (the top level of the repository, not the dxr folder within it)
+(use `--user` on the `install` to install into `~/.local`.)
 
-    # If you want to customize VM configuration for your environment, run the
-    # line below, and change the settings you need, e.g. turning off NFS:
-    cp vagrantconfig_local.yaml-dist vagrantconfig_local.yaml
+# Using #
 
-    vagrant up
-    vagrant ssh
+Put `emacs/dxr.el` somewhere suitable, and add something like the
+following to `~/.emacs` or equivalent:
 
-On the VM...
+    (autoload 'dxr-decorate-buffer "dxr")
+	(add-hook 'c-mode-common-hook 'dxr-decorate-buffer)
 
-    cd ~/dxr
-    make
-    cd ~/dxr/tests/test_basic
-    make
-    dxr-serve.py target
+The indexing script is dxr-index.py and is used to build whatever code
+you're interested in with the clang plugin.  It creates trivial
+shellscripts called cc, gcc, etc., and puts those first on the PATH.
+So you can do something like:
 
-Then, on your host box, surf to http://33.33.33.77:8000/, and poke around to
-your heart's content. You may have to substitute the IP address of your Vagrant
-machine.
+    % dxr-index.py -s llvm-trunk -b llvm-indexobj \
+      "../llvm-trunk; ./configure; make -j4"
 
-Please note that the vagrant image is built against virtualbox
-4.2.0. If your version is older, the image might not work as expected.
+and inside `llvm-indexobj` you'll get a build, and you'll also get
+`llvm-trunk/dxr-xref.sqlite`.
 
+The database is a slightly modified and heavily reduced form of the
+database used by DXR.  It contains only information produced by the
+clang plugin (so no trigram data), and most of the id columns have
+gone.  Instead, dxr-lookup.py correlates entities using file,line,col
+of the relevant declaration.
 
-### Troubleshooting
+**Beware** that the build directory (given after `-b`) is normally
+deleted.  If it's the same as the source directory or if it's `.`,
+then it's not.  (`.` is something of a special case.  You might use it
+for something like `debuild` where you want the command run in the
+currect directory.)
 
-If, after trying a search, you see the error...
+The flag `-t` can be used to give an alternative temporary directory,
+should `tmp` be unsuitable.  It may need a fair bit of storage
+(depending on the size of the code being indexed, obviously).  DXR
+stores CSV files which can really use up space; this variant stores
+gzipped CSV, so takes much less, at the expense of processing time.
 
-    Server Error
-    .....
-    Database error: no such module: trilite
+For the trunk of llvm and clang, I find I need about 900M of temporary
+storage, and the final database takes up 450M.
 
-SSH into the VM and, run `ldconfig` as root to sort out the shared library
-linking problem. Then restart `dxr-serve.py`, and all should work as expected.
+In some file inside the source, the emace function
+`dxr-decorate-buffer` runs `dxr-index.py decorate <file>`.  That sets
+up overlays and things for symbols; on any such symbol use `C-c C-c`
+and you get a buffer showing declaration, definitions and references
+of the symbol.  It also pushes `point` on to the normal tag ring so
+after visiting one of the other files `M-*` will return to the
+original symbol.
 
+# Updating the database (and build) #
 
-## Installing on a Real Machine
+There's some support for incremental operation, though I won't
+guarantee it gives entirely correct results:
 
-*dxr requires exactly llvm-3.2 to build. Anything newer or older will break the
-build.*
+    % dxr-index.py -i -s llvm-trunk -b llvm-indexobj "make"
 
-To install DXR on a machine of your choice, do the following
+# Known bugs #
 
-1. Install the dependencies in `docs/deployment.mkd`.
-
-2. You can either install dxr at the system level (requires root) or inside a
-   [virtualenv](http://www.virtualenv.org/en/latest/) which is the recommended
-   way.
-   * For a system-level install, run `python2.6 setup develop` (to hack on DXR
-     itself) or `python2.6 setup.py install` to install it.
-   * The recommended way is to install it as an unprivileged (non-root) user.
-     For this, use [virtualenv](http://www.virtualenv.org/en/latest/):
-
-             virtualenv my-dxr-env
-             source my-dxr-env/bin/activate  # You'll have to repeat this line each time
-                                             # you want to use DXR in a new shell.
-             pip install -r requirements.txt
-             python setup.py develop         # Magic path munging will make this the
-                                             # copy of Python in the virtualenv.
-
-4. Next, you need to build the various binaries that `dxr` needs. Running
-   `make` at the top level should do the needful.
-   * It should build the `libtrilite.so` library inside the `trilite` directory.
-   * It should build the `libclang-index-plugin.so` inside the
-     `dxr/plugins/clang` directory. You might have to edit the `makefile` in
-     that directory to make the locations of `llvm-config`, `clang` and
-     `clang++` accurate. As mentioned earlier, the compile will succeed only
-     with exactly llvm/clang-3.2. Anything else will fail with this message.
-
-            dxr-index.cpp: In function 'std::string {anonymous}::getQualifiedName(const clang::NamedDecl&)':
-            dxr-index.cpp:93:13: error: 'const class clang::FunctionType' has no member named 'isConst'
-
-5. The `tests/test_basic` directory contains a small tree which you can build
-   an index for to test your build. `cd` into this directory and run `make`. If
-   it successfully runs, your build is fine.
-
-6. Then run `LD_LIBRARY_PATH=/path/to/dxr/trilite dxr-serve.py
-   tests/test_basic/target` to start the server and browse the code. Without
-   the `LD_LIBRARY_PATH`, it will complain about not being able to find the
-   `trilite` module when you do a search on the web interface. You can dispense
-   with this requirement by installing the library globally on your machine: on
-   Linux, move `libtrilite.so` to `/usr/local/lib`, then run `ldconfig`.
-
-
-## Things To Do
-_This is a short list of major things that could be done to improve DXR._
-
-  * Refactor the database schema
-     - Remove plugin specific tables
-     - Provide data collection API for plugins (ie. no direct database access for plugins)
-     - Optimize schema for search queries
-        - Store extents as a blob in *_refs, types, functions, etc.
-        - Use trilite for functions, types, macros, etc.
-        - Store the transitive closure of indirect calls
-     - Port search logic to new schema
-  * Write proper search query parser
-     - Space is a delimiter unless in dice `[ ]`, quotes `" "` or escaped `\ `
-     - Assume grep syntax for terms, `path:`, `type:`, etc. (ie. `*` is literal, `\*` is kleene star)
-     - Let quotes "text" be literal terms, `path:`, `function:`, etc.
-     - egrep syntax for `regexp:`, `regex:` and `egrep:` ie. `*` is kleene star, `\*` is literal)
-     - Prefix `+` implies case sensitivity (and fully qualified `type:`, `function:`, etc.)
-     - Prefix `-` implies negation (prefix `-+` and `+-` is case sensitive negation)
-     (Prefix `+`, `-`, `+-` and `-+` can be applied to terms, `path:`, `type:`, `egrep:`, etc.)
-  * Minor refactoring of template interface to minimize size
-     - Reuse annotations (i.e., don't store the same annotation for each line)
-     - Reuse menus (i.e., don't store the same menu for each occurrence)
-  * Minor UI fixes and cleanup
-     - Colorize highlighted matches (highlight with classes, .m1, .m2, ..., use merge-extents)
-     - Make the UI pretty
-     - Add option in "Advanced" search to disable redirect (use cookies to remember setting)
-     - Minimize template size (at 20 MiB for 20k lines, this is a real issue)
-  * Add tree format version number to generated trees
-    (Don't merge generated output with different formats, when configuring update cron job)
+In builds with C and C++, it's common to share headers between the
+two.  That can cause an issue when an incremental update only rebuilds
+a C file including that header--you'll lose any C++-only information.
