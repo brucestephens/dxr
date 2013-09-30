@@ -744,9 +744,9 @@ public:
       // now.
       return;
     beginRecord("ref", refLoc);
-    std::string qn(getQualifiedName(*d));
-    if (qn.find("::") != std::string::npos)
-      recordValue("qualname", qn);
+    // std::string qn(getQualifiedName(*d));
+    // if (qn.find("::") != std::string::npos)
+    //   recordValue("qualname", qn);
     NamedDecl* decl = dyn_cast<NamedDecl>(d->getCanonicalDecl());
     if (TagDecl* tagdecl = dyn_cast<TagDecl>(d))
       decl = tagdecl->getCanonicalDecl();

@@ -82,13 +82,10 @@ class index:
             allthings[k] = self.identify(v)
         things = {}
         for row in self.cursor.execute('SELECT decl_file_id,decl_file_line, decl_file_col, ' \
-                                       'extent_start, extent_end'+getname+ \
-                                       ' FROM %s_refs WHERE extent_start NOT NULL AND decl_file_id NOT NULL AND file_id=?'%kind, (id,)):
+                                       'extent_start, extent_end ' \
+                                       'FROM %s_refs WHERE extent_start NOT NULL AND decl_file_id NOT NULL AND file_id=?'%kind, (id,)):
             fid, line, col = row['decl_file_id'], row['decl_file_line'],row['decl_file_col']
-            if kind == 'macro':
-                name = ''
-            else:
-                name = row[defn_name(kind)]
+            name = ''
             things[(row['extent_start'],row['extent_end'])] = (kind,fid,line,col,name)
         for k,v in things.iteritems():
             allthings[k] = self.identify(v)

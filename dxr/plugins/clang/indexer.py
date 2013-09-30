@@ -126,7 +126,6 @@ schema = dxr.schema.Schema({
     "namespace_refs": [
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("qualname", "VARCHAR(256)", False),
         ("_location", True),
     ],
     # Namespace aliases
@@ -143,7 +142,6 @@ schema = dxr.schema.Schema({
     "namespace_alias_refs": [
         ("extent_start", "INTEGER", True),
         ("extent_end", "INTEGER", True),
-        ("qualname", "VARCHAR(256)", False),   # Fully-qualified name of the namespace alias
         ("_location", True),
     ],
     # References to functions
@@ -152,7 +150,6 @@ schema = dxr.schema.Schema({
         ("extent_end", "INTEGER", True),
         ("_ulocation", True),
         ("_location", True, 'decl'),
-        ("qualname", "VARCHAR(256)", True),
     ],
     # References to macros
     "macro_refs": [
@@ -167,7 +164,6 @@ schema = dxr.schema.Schema({
         ("extent_end", "INTEGER", True),
         ("_ulocation", True),
         ("_location", True, 'decl'),
-        ("qualname", "VARCHAR(256)", True),
     ],
     # References to typedefs
     "typedef_refs": [
@@ -175,7 +171,6 @@ schema = dxr.schema.Schema({
         ("extent_end", "INTEGER", True),
         ("_ulocation", True),
         ("_location", True, 'decl'),
-        ("qualname", "VARCHAR(256)", True),
     ],
     # References to variables
     "variable_refs": [
@@ -183,7 +178,6 @@ schema = dxr.schema.Schema({
         ("extent_end", "INTEGER", True),
         ("_ulocation", True),
         ("_location", True, 'decl'),
-        ("qualname", "VARCHAR(256)", True),
     ],
     # Warnings found while compiling
     "warnings": [
