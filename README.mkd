@@ -57,10 +57,10 @@ storage, and the final database takes up 450M.
 
 In some file inside the source, the emace function
 `dxr-decorate-buffer` runs `dxr-index.py decorate <file>`.  That sets
-up overlays and things for symbols; on any such symbol use `C-c C-c`
-and you get a buffer showing declaration, definitions and references
-of the symbol.  It also pushes `point` on to the normal tag ring so
-after visiting one of the other files `M-*` will return to the
+up overlays and things for symbols; on any such symbol use `M-RET` or
+`M-g .` and you get a buffer showing declaration, definitions and
+references of the symbol.  It also pushes `point` on to the normal tag
+ring so after visiting one of the other files `M-*` will return to the
 original symbol.
 
 # Updating the database (and build) #

@@ -11,7 +11,7 @@
   "Keymap used in dxr overlays")
 
 (define-key dxr-find-keymap (kbd "M-RET") 'dxr-on-click)
-(define-key dxr-find-keymap (kbd "C-c C-c") 'dxr-on-click)
+(define-key dxr-find-keymap (kbd "M-g .") 'dxr-on-click)
 
 (defun dxr-find-id (point)
   (interactive "d")
