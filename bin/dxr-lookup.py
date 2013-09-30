@@ -319,6 +319,34 @@ class index:
                                            'decl_file_col=? ORDER BY path,file_line',(id,line,col)):
                 sys.stdout.write('%s:%d:%d\n'%(row[0],row[1],row[2]))
 
+    def show_search(self, type, string):
+        if type=='exact':
+            search = '== ?'
+        elif type=='prefix':
+            search = 'GLOB ?'
+            string += '*'
+        elif type=='glob':
+            search = 'GLOB ?'
+        elif type=='substring':
+            search = 'GLOB ?'
+            string = '*'+string+'*'
+        for kind in ['function','variable','type','typedef','macro']:
+            if kind=='macro':
+                name='name'
+            else:
+                name='qualname'
+            results = []
+            for row in self.cursor.execute('SELECT %s,path,decl_file_line,decl_file_col ' \
+                                           'FROM %ss,files WHERE decl_file_id=id AND %s %s ' \
+                                           'ORDER BY path,decl_file_line'%(name,kind,name,search),
+                                           (string,)):
+                results.append((row[0],row[1],row[2],row[3]))
+            if len(results)>0:
+                sys.stdout.write('\n%ss:\n'%kind)
+                for v in results:
+                    name,path,line,col = v
+                    sys.stdout.write('%s:%d:%d  %s\n'%(path,line,col,name))
+
 def defn_id(kind):
     if kind == 'function' or kind == 'variable' or kind == 'type':
         return 'file_id'
@@ -365,6 +393,9 @@ def info(args):
     id, line, col = args.id, args.line, args.col
     args.idx.show_info(args.kind, id, line, col)
 
+def search(args):
+    args.idx.show_search(args.type, args.string)
+
 def main():
     import argparse
     import os
@@ -381,6 +412,11 @@ def main():
     parser_menu.add_argument('line')
     parser_menu.add_argument('col')
     parser_menu.set_defaults(func=info)
+
+    parser_search = subparsers.add_parser('search')
+    parser_search.add_argument('-t','--type', choices=['exact','prefix','glob','substring'], default='substring')
+    parser_search.add_argument('string')
+    parser_search.set_defaults(func=search)
 
     args = parser.parse_args()
     args.database = os.path.realpath(os.path.abspath(os.curdir))

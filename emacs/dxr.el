@@ -12,6 +12,8 @@
 
 (define-key dxr-find-keymap (kbd "M-RET") 'dxr-on-click)
 (define-key dxr-find-keymap (kbd "M-g .") 'dxr-on-click)
+(define-key c-mode-map (kbd "M-g M-s") 'dxr-search)
+(define-key c++-mode-map (kbd "M-g M-s") 'dxr-search)
 
 (defun dxr-find-id (point)
   (interactive "d")
@@ -38,6 +40,13 @@
 	   (ring-insert find-tag-marker-ring (point-marker))
 	   (find-file (expand-file-name (cadr dxr-id) dxr-root)))
 	  (dxr-id (dxr-run-info dxr-id)))))
+
+(defun dxr-search (string)
+  (interactive "sSearch string:")
+  (cond ((and dxr-root (not (string= string "")))
+	 (ring-insert find-tag-marker-ring (point-marker))
+	 (compilation-start (format "cd %s; dxr-lookup.py search %s" dxr-root string)
+			    'grep-mode))))
 
 (defun dxr-make-overlay (key start end)
     (let ((overlay (make-overlay (1+ start) (1+ end))))
