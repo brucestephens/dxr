@@ -120,6 +120,20 @@ class index:
             self.file[int(row[0])] = row[1]
 
     def show_info(self,kind,id,line,col):
+        if kind=='function' or kind=='variable':
+            gettype = ',type'
+        else:
+            gettype = ''
+        name = defn_name(kind)
+        sys.stdout.write('\n%s: '%kind)
+        for row in self.cursor.execute('SELECT '+name+gettype+' FROM '+kind+'s WHERE ' \
+                                       'decl_file_id=? ' \
+                                       'AND decl_file_line=? '\
+                                       'AND decl_file_COL=? ', (id,line,col)):
+            if gettype != '':
+                sys.stdout.write('%s '%row['type'])
+            sys.stdout.write('%s\n\n'%row[name])
+
         if kind=='function':
             sys.stdout.write('Declaraton:\n')
             for row in self.cursor.execute('SELECT path FROM files WHERE id=?',(id,)):
