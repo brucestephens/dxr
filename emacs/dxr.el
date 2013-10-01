@@ -104,9 +104,14 @@
 				(nth 4 args))))
 		 (puthash (list kind id line col)
 			  (if type
-			      (cons name type)
+			      (format "%s %s" type name)
 			    name) dxr-decl)))
 	       )))
-    (kill-buffer dxr-buffer)))
+    (kill-buffer dxr-buffer)
+    (maphash (lambda (key overlays)
+	       (let ((text (gethash key dxr-decl)))
+		 (mapc (lambda (o)
+			 (overlay-put o 'help-echo text))
+		       overlays))) dxr-overlays)))
 
 (provide 'dxr)
