@@ -1,6 +1,8 @@
 (require 'easymenu)
 (require 'etags)
 (require 'ring)
+(require 'timer)
+(require 'pulse)
 
 (make-variable-buffer-local 'dxr-root)
 (make-variable-buffer-local 'dxr-self)
@@ -23,6 +25,18 @@
 	      (and id (setq dxr-id id))))
 	  (overlays-at point))
     dxr-id))
+
+(defun dxr-idle-highlight ()
+  (interactive)
+  (let ((dxr-id (dxr-find-id (point)))
+	(pulse-flag nil))
+    (and dxr-id
+	 dxr-overlays
+	 (mapc (lambda (o)
+		 (pulse-momentary-highlight-overlay o))
+	       (gethash dxr-id dxr-overlays)))))
+
+(run-with-idle-timer 0.5 t 'dxr-idle-highlight)
 
 (defun dxr-run-info (key)
   (interactive)
